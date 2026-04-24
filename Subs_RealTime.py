@@ -239,8 +239,18 @@ class App:
     # ── UTILS ────────────────────────────────────────
 
     def extract_id(self, text):
-        m = re.search(r'([a-z0-9]{6,12})', text)
-        return m.group(1) if m else None
+        patrones = [
+            r'wistia\.com/medias/([a-z0-9]+)',          # URL directa
+            r'wistia\.net/embed/iframe/([a-z0-9]+)',     # iframe embed
+            r'wistia_async_([a-z0-9]+)',                 # embed clásico
+            r'mediaId["\s:=]+["\']?([a-z0-9]{6,12})',   # atributo mediaId
+            r'(?<![a-z0-9])([a-z0-9]{10})(?![a-z0-9])', # ID solo (exactamente 10 chars)
+        ]
+    for patron in patrones:
+        m = re.search(patron, text)
+        if m:
+            return m.group(1)
+    return None
 
     def label_error(self, msg):
         self.clear()
