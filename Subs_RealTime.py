@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
+import warnings
+warnings.filterwarnings("ignore", category=Warning, module="urllib3")
 
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
+import queue
 import re
 import time
 import sys
@@ -44,8 +49,8 @@ def fetch_captions(video_id: str) -> list[dict]:
     return lines
 
 
-def translate_all(lines: list[dict]) -> list[dict]:
-    """Traduce todos los segmentos al inicio. Muestra progreso en terminal."""
+def translate_all(lines: list[dict], on_progress=None) -> list[dict]:
+    """Traduce todos los segmentos. Si se pasa on_progress(done, total) lo llama por segmento."""
     translator = GoogleTranslator(source=IDIOMA_ORIGEN, target=IDIOMA_DESTINO)
     result = []
     total  = len(lines)
@@ -65,7 +70,9 @@ def translate_all(lines: list[dict]) -> list[dict]:
             "translation": translated,
         })
 
-        if (i + 1) % 15 == 0 or (i + 1) == total:
+        if on_progress:
+            on_progress(i + 1, total)
+        elif (i + 1) % 15 == 0 or (i + 1) == total:
             print(f"[INFO] Traducidos {i+1}/{total}...")
 
     return result
@@ -262,6 +269,172 @@ class TraductorApp:
         self.root.mainloop()
 
 
+# ── Ventana de carga ─────────────────────────────────────────────────────────
+
+class LoadingWindow:
+    """Ventana con barra de progreso mientras se descargan y traducen los subs."""
+
+    _BAR_H = 8
+    _WIN_W = 440
+    _WIN_H = 200
+
+    def __init__(self, video_id: str):
+        self.video_id       = video_id
+        self.captions       = None
+        self.error          = None
+        self._queue         = queue.Queue()
+        self._indeterminate = False
+        self._anim_pos      = 0
+
+        self.root = tk.Tk()
+        self.root.title("Cargando subtítulos…")
+        self.root.configure(bg="#0d0d0d")
+        self.root.resizable(False, False)
+        self.root.attributes("-topmost", True)
+
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x  = (sw - self._WIN_W) // 2
+        y  = (sh - self._WIN_H) // 2
+        self.root.geometry(f"{self._WIN_W}x{self._WIN_H}+{x}+{y}")
+
+        self._build_ui()
+
+    def _build_ui(self):
+        tk.Label(
+            self.root,
+            text="Subtítulos Wistia",
+            fg="#00e87a", bg="#0d0d0d",
+            font=("sans-serif", 13, "bold"),
+            pady=20,
+        ).pack()
+
+        self.lbl_status = tk.Label(
+            self.root,
+            text="Iniciando…",
+            fg="#cccccc", bg="#0d0d0d",
+            font=("sans-serif", 11),
+        )
+        self.lbl_status.pack()
+
+        bar_outer = tk.Frame(self.root, bg="#0d0d0d")
+        bar_outer.pack(fill="x", padx=32, pady=14)
+
+        self.canvas = tk.Canvas(
+            bar_outer, height=self._BAR_H,
+            bg="#2a2a2a", highlightthickness=0,
+        )
+        self.canvas.pack(fill="x")
+        self.canvas.update_idletasks()
+
+        self._bar = self.canvas.create_rectangle(
+            0, 0, 0, self._BAR_H, fill="#00e87a", outline=""
+        )
+
+        self.lbl_detail = tk.Label(
+            self.root,
+            text="",
+            fg="#666666", bg="#0d0d0d",
+            font=("monospace", 10),
+            pady=4,
+        )
+        self.lbl_detail.pack()
+
+    # ── Progreso ─────────────────────────────────────────────────────────────
+
+    def _set_progress(self, pct: float, detail: str = ""):
+        w = self.canvas.winfo_width()
+        self.canvas.coords(self._bar, 0, 0, int(w * pct / 100), self._BAR_H)
+        if detail:
+            self.lbl_detail.config(text=detail)
+
+    def _tick_indeterminate(self):
+        if not self._indeterminate:
+            return
+        w   = max(self.canvas.winfo_width(), 1)
+        seg = max(80, w // 4)
+        pos = self._anim_pos % (w + seg)
+        x0  = pos - seg // 2
+        x1  = x0 + seg
+        self.canvas.coords(
+            self._bar,
+            max(0, x0), 0, min(w, x1), self._BAR_H,
+        )
+        self._anim_pos += 10
+        self.root.after(30, self._tick_indeterminate)
+
+    # ── Hilo de fondo ────────────────────────────────────────────────────────
+
+    def _worker(self):
+        try:
+            self._queue.put(("phase", "download"))
+            lines = fetch_captions(self.video_id)
+
+            if not lines:
+                raise ValueError("El video no tiene captions en inglés.")
+
+            total = len(lines)
+            self._queue.put(("phase", "translate", total))
+
+            def cb(done, tot):
+                self._queue.put(("progress", done, tot))
+
+            result = translate_all(lines, on_progress=cb)
+            self._queue.put(("done", result))
+
+        except Exception as exc:
+            self._queue.put(("error", str(exc)))
+
+    # ── Polling del hilo principal ───────────────────────────────────────────
+
+    def _poll(self):
+        try:
+            while True:
+                msg = self._queue.get_nowait()
+                tag = msg[0]
+
+                if tag == "phase":
+                    if msg[1] == "download":
+                        self.lbl_status.config(text="Descargando subtítulos…")
+                        self._indeterminate = True
+                        self._anim_pos = 0
+                        self._tick_indeterminate()
+                    elif msg[1] == "translate":
+                        total = msg[2]
+                        self._indeterminate = False
+                        self.lbl_status.config(
+                            text=f"Traduciendo {total} segmentos al español…"
+                        )
+                        self._set_progress(0)
+
+                elif tag == "progress":
+                    _, done, total = msg
+                    pct = done / total * 100
+                    self._set_progress(pct, f"{done} / {total}  ·  {pct:.0f}%")
+
+                elif tag == "done":
+                    self.captions = msg[1]
+                    self.root.destroy()
+                    return
+
+                elif tag == "error":
+                    self.error = msg[1]
+                    self.root.destroy()
+                    return
+
+        except queue.Empty:
+            pass
+
+        self.root.after(50, self._poll)
+
+    def run(self) -> list[dict] | None:
+        t = threading.Thread(target=self._worker, daemon=True)
+        t.start()
+        self.root.after(80, self._poll)
+        self.root.mainloop()
+        return self.captions
+
+
 # ── Extracción del video ID ───────────────────────────────────────────────────
 
 _WISTIA_PATTERNS = [
@@ -283,11 +456,11 @@ def extract_video_id(text: str) -> str | None:
     return None
 
 
-class _PasteDialog(tk.Toplevel):
+class _PasteDialog(tk.Tk):
     """Diálogo que acepta HTML, URL o ID y extrae el video ID en tiempo real."""
 
-    def __init__(self, parent):
-        super().__init__(parent)
+    def __init__(self):
+        super().__init__()
         self.result = None
         self.title("Video — pegá el embed o el ID")
         self.resizable(False, False)
@@ -320,6 +493,14 @@ class _PasteDialog(tk.Toplevel):
         btn_frame = tk.Frame(self, bg="#1c1c1c")
         btn_frame.pack(fill="x", padx=14, pady=10)
 
+        # BOTÓN PEGAR (fallback seguro)
+        tk.Button(
+            btn_frame, text="Pegar", command=self._force_paste,
+            bg="#444444", fg="#ffffff",
+            font=("sans-serif", 11),
+            relief="flat", padx=12, pady=5, cursor="hand2",
+        ).pack(side="left")
+
         tk.Button(
             btn_frame, text="Continuar", command=self._ok,
             bg="#00e87a", fg="#000000",
@@ -334,17 +515,42 @@ class _PasteDialog(tk.Toplevel):
             relief="flat", padx=16, pady=5, cursor="hand2",
         ).pack(side="right", padx=8)
 
-        self.txt.bind("<KeyRelease>",  self._on_change)
-        self.txt.bind("<<Paste>>",     lambda e: self.after(10, self._on_change))
+        # Eventos
+        self.txt.bind("<KeyRelease>", self._on_change)
+        self.txt.bind("<<Paste>>", lambda e: self.after(10, self._on_change))
+        self.txt.bind("<Command-v>", self._force_paste)
 
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        # Posicionar ventana
         self.update_idletasks()
         w = self.winfo_reqwidth()
         h = self.winfo_reqheight()
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"+{x}+{y}")
-        self.grab_set()
-        self.txt.focus_set()
+
+        # 🔥 CLAVE EN MAC
+        self.lift()
+        self.focus_force()
+        self.after(100, lambda: self.txt.focus_force())
+
+    def _force_paste(self, _e=None):
+        """Pegado manual desde clipboard para macOS."""
+        try:
+            self.txt.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+
+        try:
+            text = self.clipboard_get()
+            self.txt.insert(tk.INSERT, text)
+            self.after(10, self._on_change)
+        except tk.TclError:
+            print("No se pudo acceder al portapapeles")
+
+        return "break"
 
     def _on_change(self, _e=None):
         vid = extract_video_id(self.txt.get("1.0", "end"))
@@ -359,15 +565,15 @@ class _PasteDialog(tk.Toplevel):
             self.result = vid
             self.destroy()
         else:
-            self.lbl_id.config(text="❌ No se encontró un ID de Wistia válido", fg="#ff5555")
+            self.lbl_id.config(
+                text="❌ No se encontró un ID de Wistia válido",
+                fg="#ff5555"
+            )
 
-
+            
 def ask_video_id() -> str:
-    root = tk.Tk()
-    root.withdraw()
-    dlg = _PasteDialog(root)
-    root.wait_window(dlg)
-    root.destroy()
+    dlg = _PasteDialog()
+    dlg.mainloop()
     return dlg.result or ""
 
 
@@ -385,22 +591,14 @@ def main():
 
     print(f"\n→ Video ID: {video_id}")
 
-    try:
-        lines = fetch_captions(video_id)
-    except requests.HTTPError as e:
-        print(f"❌ No se pudo descargar las captions: {e}")
-        sys.exit(1)
-    except ValueError as e:
-        print(f"❌ {e}")
+    loader   = LoadingWindow(video_id)
+    captions = loader.run()
+
+    if captions is None:
+        print(f"❌ {loader.error or 'Error desconocido'}")
         sys.exit(1)
 
-    if not lines:
-        print("❌ El video no tiene captions en inglés.")
-        sys.exit(1)
-
-    print(f"→ Traduciendo {len(lines)} segmentos al español...")
-    captions = translate_all(lines)
-    print("✓ Todo listo. Abriendo ventana...\n")
+    print(f"✓ Todo listo ({len(captions)} segmentos). Abriendo ventana…\n")
     print("  Controles:")
     print("  · ▶ Iniciar / ⏸ Pausar  (o barra espaciadora)")
     print("  · ◀ / ▶ ajustan ±2s si el texto se desfasa")
