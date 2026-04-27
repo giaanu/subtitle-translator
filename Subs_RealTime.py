@@ -246,11 +246,11 @@ class App:
             r'mediaId["\s:=]+["\']?([a-z0-9]{6,12})',   # atributo mediaId
             r'(?<![a-z0-9])([a-z0-9]{10})(?![a-z0-9])', # ID solo (exactamente 10 chars)
         ]
-    for patron in patrones:
-        m = re.search(patron, text)
-        if m:
-            return m.group(1)
-    return None
+        for patron in patrones:
+            m = re.search(patron, text)
+            if m:
+                return m.group(1)
+        return None
 
     def label_error(self, msg):
         self.clear()
